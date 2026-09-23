@@ -113,3 +113,45 @@ async def test_massive():
             "ok": False,
             "error": str(e)
         }
+@app.get("/api/test-minutes")
+async def test_minutes():
+    import httpx
+    from datetime import date, timedelta
+    from .config import MASSIVE_API_KEY, MASSIVE_BASE
+
+    end = date.today()
+    start = end - timedelta(days=2)
+
+    url = (
+        f"{MASSIVE_BASE}/v2/aggs/ticker/AAPL/"
+        f"range/1/minute/{start}/{end}"
+    )
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.get(
+                url,
+                params={
+                    "adjusted": "true",
+                    "sort": "asc",
+                    "limit": 5000,
+                    "apiKey": MASSIVE_API_KEY
+                }
+            )
+
+        data = response.json()
+        results = data.get("results", [])
+
+        return {
+            "ok": response.status_code == 200,
+            "status_code": response.status_code,
+            "ticker": "AAPL",
+            "rows": len(results),
+            "first": results[0] if results else None
+        }
+
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e)
+        }
