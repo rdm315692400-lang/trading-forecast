@@ -12,12 +12,30 @@ from .config import (
     get_asset_name,
 )
 
-app = FastAPI()
 
-app.mount("/static", StaticFiles(directory="app/static"), name="static")
+app = FastAPI(
+    title="Trading Forecast",
+    version="8.0"
+)
 
-forecast_cache = {}
+app.mount(
+    "/static",
+    StaticFiles(directory="app/static"),
+    name="static"
+)
 
+
+# =========================
+# CACHE
+# =========================
+
+scan_cache = {}
+scan_position = 0
+
+
+# =========================
+# HOME
+# =========================
 
 @app.get("/")
 async def home():
@@ -30,141 +48,59 @@ async def home_head():
 
 
 @app.get("/sw.js")
-async def sw():
+async def service_worker():
     return FileResponse(
         "app/static/sw.js",
         media_type="application/javascript"
     )
 
 
+# =========================
+# HEALTH
+# =========================
+
 @app.get("/health")
 async def health():
     return {
         "ok": True,
-        "assets": len(TICKERS)
+        "version": "8.0",
+        "assets": len(TICKERS),
+        "stocks_connected": len(MASSIVE_STOCK_TICKERS)
     }
 
-async def scan_all_assets():
-    """
-    סורק מאוחד:
-    45 מניות + 10 מדדים + 10 סחורות.
-    בסוף מוחזר מועמד מוביל אחד.
-    """
 
-    candidates = []
-
-    # כרגע סריקת המניות בלבד מחוברת ל-Massive.
-    # המדדים והסחורות יחוברו למקורות הנתונים
-    # המתאימים בלי לשנות את מבנה הסורק.
-    symbols = MASSIVE_STOCK_TICKERS
-
-    url = (
-        f"{MASSIVE_BASE}/v2/snapshot/locale/us/"
-        f"markets/stocks/tickers"
-    )
-
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            response = await client.get(
-                url,
-                params={
-                    "tickers": ",".join(symbols),
-                    "include_otc": "false",
-                    "apiKey": MASSIVE_API_KEY
-                }
-            )
-
-        if response.status_code != 200:
-            return {
-                "ok": False,
-                "status": response.status_code,
-                "message": "שגיאה בקבלת נתוני הסריקה"
-            }
-
-        data = response.json()
-
-        for item in data.get("tickers", []):
-            symbol = item.get("ticker")
-
-            day = item.get("day") or {}
-
-            price = float(day.get("c") or 0)
-            volume = float(day.get("v") or 0)
-            change = float(
-                item.get("todaysChangePerc") or 0
-            )
-
-            # ציון ראשוני בלבד.
-            # בהמשך יוחלף במודל המלא.
-            score = abs(change)
-
-            candidates.append({
-                "symbol": symbol,
-                "name": get_asset_name(symbol),
-                "category": "מניה",
-                "price": price,
-                "change_percent": round(change, 2),
-                "volume": volume,
-                "score": round(score, 2)
-            })
-
-        candidates.sort(
-            key=lambda x: x["score"],
-            reverse=True
-        )
-
-        leader = (
-            candidates[0]
-            if candidates
-            else None
-        )
-
-        return {
-            "ok": True,
-
-            # היעד הקבוע של המערכת
-            "universe": 65,
-
-            # כמה נכסים מחוברים כרגע בפועל
-            "currently_scanned": len(candidates),
-
-            # בסוף תמיד מועמד אחד
-            "leader": leader,
-
-            # נשאיר את הדירוג לצורך עבודת המנוע
-            "ranking": candidates
-        }
-
-    except Exception as e:
-        return {
-            "ok": False,
-            "error": str(e)
-        }
-
-scan_cache = {}
-scan_position = 0
-
+# =========================
+# SCAN ONE ASSET
+# =========================
 
 @app.get("/api/scan")
 async def scan_next_asset():
     global scan_position
 
-    # בשלב הראשון: 45 המניות שיש להן מקור נתונים פעיל
     symbols = MASSIVE_STOCK_TICKERS
 
     if not symbols:
         return {
             "ok": False,
-            "message": "אין נכסים לסריקה"
+            "message": "אין נכסים מחוברים לסריקה"
         }
 
-    symbol = symbols[scan_position % len(symbols)]
+    symbol = symbols[
+        scan_position % len(symbols)
+    ]
+
     scan_position += 1
 
-    url = f"{MASSIVE_BASE}/v2/aggs/ticker/{symbol}/prev"
+    url = (
+        f"{MASSIVE_BASE}/v2/aggs/"
+        f"ticker/{symbol}/prev"
+    )
 
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
+        async with httpx.AsyncClient(
+            timeout=20
+        ) as client:
+
             response = await client.get(
                 url,
                 params={
@@ -177,75 +113,144 @@ async def scan_next_asset():
             return {
                 "ok": False,
                 "symbol": symbol,
+                "name": get_asset_name(symbol),
                 "status": response.status_code,
-                "cached": len(scan_cache)
+                "scanned_so_far": len(scan_cache)
             }
 
         data = response.json()
-        rows = data.get("results", [])
+
+        rows = data.get(
+            "results",
+            []
+        )
 
         if not rows:
             return {
                 "ok": False,
                 "symbol": symbol,
+                "name": get_asset_name(symbol),
                 "message": "אין נתונים"
             }
 
         row = rows[0]
 
-        open_price = float(row.get("o") or 0)
-        close_price = float(row.get("c") or 0)
-        high_price = float(row.get("h") or 0)
-        low_price = float(row.get("l") or 0)
-        volume = float(row.get("v") or 0)
+        open_price = float(
+            row.get("o") or 0
+        )
 
-        change = 0.0
+        high_price = float(
+            row.get("h") or 0
+        )
+
+        low_price = float(
+            row.get("l") or 0
+        )
+
+        close_price = float(
+            row.get("c") or 0
+        )
+
+        volume = float(
+            row.get("v") or 0
+        )
+
+        change_percent = 0.0
         range_percent = 0.0
 
         if open_price > 0:
-            change = (
-                (close_price / open_price) - 1
+
+            change_percent = (
+                (close_price / open_price)
+                - 1
             ) * 100
 
             range_percent = (
-                (high_price - low_price) / open_price
+                (high_price - low_price)
+                / open_price
             ) * 100
 
-        # ציון ראשוני לסינון בלבד
+
+        # ציון ראשוני בלבד לסינון.
+        # בהמשך נחבר את מנוע התחזית המלא.
         score = (
-            abs(change) * 0.60
+            abs(change_percent) * 0.60
             + range_percent * 0.40
         )
+
 
         scan_cache[symbol] = {
             "symbol": symbol,
             "name": get_asset_name(symbol),
             "category": "מניה",
-            "price": round(close_price, 3),
-            "change_percent": round(change, 2),
-            "range_percent": round(range_percent, 2),
+            "price": round(
+                close_price,
+                3
+            ),
+            "change_percent": round(
+                change_percent,
+                2
+            ),
+            "range_percent": round(
+                range_percent,
+                2
+            ),
             "volume": volume,
-            "score": round(score, 2)
+            "score": round(
+                score,
+                2
+            )
         }
+
 
         ranking = sorted(
             scan_cache.values(),
-            key=lambda x: x["score"],
+            key=lambda item: item["score"],
             reverse=True
         )
 
+
+        leader = (
+            ranking[0]
+            if ranking
+            else None
+        )
+
+
         return {
             "ok": True,
-            "universe": 65,
-            "connected_now": 45,
-            "scanned_so_far": len(scan_cache),
-            "just_scanned": get_asset_name(symbol),
-            "leader": ranking[0] if ranking else None
+
+            # היקום המלא שהגדרנו
+            "universe": len(TICKERS),
+
+            # כרגע מקור הנתונים הפעיל
+            # מחובר ל-45 המניות
+            "connected_now": len(
+                MASSIVE_STOCK_TICKERS
+            ),
+
+            "scanned_so_far": len(
+                scan_cache
+            ),
+
+            "just_scanned": {
+                "symbol": symbol,
+                "name": get_asset_name(symbol)
+            },
+
+            "leader": leader
         }
 
+
     except Exception as e:
+
         return {
             "ok": False,
             "symbol": symbol,
+            "name": get_asset_name(symbol),
             "error": str(e)
-    }
+        }
+
+
+# =========================
+# CURRENT
