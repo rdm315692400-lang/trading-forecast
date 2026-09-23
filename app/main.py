@@ -85,3 +85,31 @@ async def test_aapl():
 @app.get("/api/simple-test")
 async def simple_test():
     return {"ok": True, "message": "server works"}
+@app.get("/api/test-massive")
+async def test_massive():
+    import httpx
+    from .config import MASSIVE_API_KEY, MASSIVE_BASE
+
+    url = f"{MASSIVE_BASE}/v2/aggs/ticker/AAPL/prev"
+
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            response = await client.get(
+                url,
+                params={
+                    "adjusted": "true",
+                    "apiKey": MASSIVE_API_KEY
+                }
+            )
+
+        return {
+            "ok": response.status_code == 200,
+            "status_code": response.status_code,
+            "response": response.json()
+        }
+
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e)
+        }
