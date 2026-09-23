@@ -141,3 +141,111 @@ async def scan_all_assets():
             "error": str(e)
         }
 
+scan_cache = {}
+scan_position = 0
+
+
+@app.get("/api/scan")
+async def scan_next_asset():
+    global scan_position
+
+    # בשלב הראשון: 45 המניות שיש להן מקור נתונים פעיל
+    symbols = MASSIVE_STOCK_TICKERS
+
+    if not symbols:
+        return {
+            "ok": False,
+            "message": "אין נכסים לסריקה"
+        }
+
+    symbol = symbols[scan_position % len(symbols)]
+    scan_position += 1
+
+    url = f"{MASSIVE_BASE}/v2/aggs/ticker/{symbol}/prev"
+
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            response = await client.get(
+                url,
+                params={
+                    "adjusted": "true",
+                    "apiKey": MASSIVE_API_KEY
+                }
+            )
+
+        if response.status_code != 200:
+            return {
+                "ok": False,
+                "symbol": symbol,
+                "status": response.status_code,
+                "cached": len(scan_cache)
+            }
+
+        data = response.json()
+        rows = data.get("results", [])
+
+        if not rows:
+            return {
+                "ok": False,
+                "symbol": symbol,
+                "message": "אין נתונים"
+            }
+
+        row = rows[0]
+
+        open_price = float(row.get("o") or 0)
+        close_price = float(row.get("c") or 0)
+        high_price = float(row.get("h") or 0)
+        low_price = float(row.get("l") or 0)
+        volume = float(row.get("v") or 0)
+
+        change = 0.0
+        range_percent = 0.0
+
+        if open_price > 0:
+            change = (
+                (close_price / open_price) - 1
+            ) * 100
+
+            range_percent = (
+                (high_price - low_price) / open_price
+            ) * 100
+
+        # ציון ראשוני לסינון בלבד
+        score = (
+            abs(change) * 0.60
+            + range_percent * 0.40
+        )
+
+        scan_cache[symbol] = {
+            "symbol": symbol,
+            "name": get_asset_name(symbol),
+            "category": "מניה",
+            "price": round(close_price, 3),
+            "change_percent": round(change, 2),
+            "range_percent": round(range_percent, 2),
+            "volume": volume,
+            "score": round(score, 2)
+        }
+
+        ranking = sorted(
+            scan_cache.values(),
+            key=lambda x: x["score"],
+            reverse=True
+        )
+
+        return {
+            "ok": True,
+            "universe": 65,
+            "connected_now": 45,
+            "scanned_so_far": len(scan_cache),
+            "just_scanned": get_asset_name(symbol),
+            "leader": ranking[0] if ranking else None
+        }
+
+    except Exception as e:
+        return {
+            "ok": False,
+            "symbol": symbol,
+            "error": str(e)
+    }
