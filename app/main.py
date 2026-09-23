@@ -3,12 +3,13 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from .config import TICKERS
-from .data import minute_history
-from .engine import forecast
 
 app = FastAPI()
 
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
+
+# כאן יישמרו בהמשך התחזיות של כל הנכסים
+forecast_cache = {}
 
 
 @app.get("/")
@@ -31,127 +32,7 @@ async def sw():
 
 @app.get("/health")
 async def health():
-    return {"ok": True}
-
-
-@app.get("/api/hottest")
-async def hottest():
-    rows = []
-
-    # בודקים כל מניה בנפרד כדי לא להעמיס על השרת
-    for ticker in TICKERS:
-        try:
-            data = await minute_history(ticker, days=10)
-            result = forecast(ticker, data)
-            rows.append(result)
-
-        except Exception as e:
-            rows.append({
-                "ticker": ticker,
-                "error": str(e),
-                "potential": -1
-            })
-
-    rows.sort(
-        key=lambda x: x.get("potential", -1),
-        reverse=True
-    )
-
-    valid = [
-        row for row in rows
-        if row.get("potential", -1) >= 0
-    ]
-
     return {
-        "leader": valid[0] if valid else None,
-        "ranking": rows
+        "ok": True,
+        "assets": len(TICKERS)
     }
-@app.get("/api/test-aapl")
-async def test_aapl():
-    try:
-        data = await minute_history("AAPL", days=2)
-
-        return {
-            "ok": True,
-            "ticker": "AAPL",
-            "rows": len(data)
-        }
-
-    except Exception as e:
-        return {
-            "ok": False,
-            "error": str(e)
-        }
-@app.get("/api/simple-test")
-async def simple_test():
-    return {"ok": True, "message": "server works"}
-@app.get("/api/test-massive")
-async def test_massive():
-    import httpx
-    from .config import MASSIVE_API_KEY, MASSIVE_BASE
-
-    url = f"{MASSIVE_BASE}/v2/aggs/ticker/AAPL/prev"
-
-    try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            response = await client.get(
-                url,
-                params={
-                    "adjusted": "true",
-                    "apiKey": MASSIVE_API_KEY
-                }
-            )
-
-        return {
-            "ok": response.status_code == 200,
-            "status_code": response.status_code,
-            "response": response.json()
-        }
-
-    except Exception as e:
-        return {
-            "ok": False,
-            "error": str(e)
-        }
-@app.get("/api/test-minutes")
-async def test_minutes():
-    import httpx
-    from datetime import date, timedelta
-    from .config import MASSIVE_API_KEY, MASSIVE_BASE
-
-    end = date.today()
-    start = end - timedelta(days=2)
-
-    url = (
-        f"{MASSIVE_BASE}/v2/aggs/ticker/AAPL/"
-        f"range/1/minute/{start}/{end}"
-    )
-
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            response = await client.get(
-                url,
-                params={
-                    "adjusted": "true",
-                    "sort": "asc",
-                    "limit": 5000,
-                    "apiKey": MASSIVE_API_KEY
-                }
-            )
-
-        data = response.json()
-        results = data.get("results", [])
-
-        return {
-            "ok": response.status_code == 200,
-            "status_code": response.status_code,
-            "ticker": "AAPL",
-            "rows": len(results),
-            "first": results[0] if results else None
-        }
-
-    except Exception as e:
-        return {
-            "ok": False,
-            "error": str(e)
-        }
