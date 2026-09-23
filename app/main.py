@@ -66,3 +66,19 @@ async def hottest():
         "leader": valid[0] if valid else None,
         "ranking": rows
     }
+@app.get("/api/test-aapl")
+async def test_aapl():
+    try:
+        data = await minute_history("AAPL", days=2)
+
+        return {
+            "ok": True,
+            "ticker": "AAPL",
+            "rows": len(data)
+        }
+
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e)
+        }
