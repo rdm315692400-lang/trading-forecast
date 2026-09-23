@@ -82,3 +82,6 @@ async def test_aapl():
             "ok": False,
             "error": str(e)
         }
+@app.get("/api/simple-test")
+async def simple_test():
+    return {"ok": True, "message": "server works"}
