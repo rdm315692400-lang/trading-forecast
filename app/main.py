@@ -225,6 +225,7 @@ def detect_market_state(sessions):
 
         trend = "ניטרלית"
 
-    strength = min(
+        strength = min(
         abs(trend_change),
-        10.
+        10.0
+    )
