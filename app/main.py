@@ -1,342 +1,230 @@
-import asyncio
-import httpx
-
-from contextlib import asynccontextmanager
-from datetime import datetime, timezone
-
-from fastapi import FastAPI
-from fastapi.responses import FileResponse
-from fastapi.staticfiles import StaticFiles
-
-from .config import (
-    TICKERS,
-    MASSIVE_STOCK_TICKERS,
-    MASSIVE_API_KEY,
-    MASSIVE_BASE,
-    get_asset_name,
-)
+from collections import defaultdict
+from statistics import mean, median
 
 
-# =========================
-# SCAN STORAGE
-# =========================
+# ==========================================
+# BASIC HELPERS
+# ==========================================
 
-scan_cache = {}
-scan_position = 0
-scan_running = False
-last_scan_time = None
+def percentile(values, p):
+    if not values:
+        return 0.0
 
+    values = sorted(float(v) for v in values)
 
-# =========================
-# SCAN ONE STOCK
-# =========================
+    if len(values) == 1:
+        return values[0]
 
-async def scan_one_stock():
-    global scan_position
-    global last_scan_time
+    position = (len(values) - 1) * p
+    lower = int(position)
+    upper = min(lower + 1, len(values) - 1)
 
-    symbols = MASSIVE_STOCK_TICKERS
+    weight = position - lower
 
-    if not symbols:
-        return None
-
-    symbol = symbols[
-        scan_position % len(symbols)
-    ]
-
-    scan_position += 1
-
-    url = (
-        f"{MASSIVE_BASE}/v2/aggs/"
-        f"ticker/{symbol}/prev"
+    return (
+        values[lower] * (1 - weight)
+        + values[upper] * weight
     )
 
-    try:
-        async with httpx.AsyncClient(
-            timeout=20
-        ) as client:
 
-            response = await client.get(
-                url,
-                params={
-                    "adjusted": "true",
-                    "apiKey": MASSIVE_API_KEY
-                }
-            )
+def safe_mean(values):
+    values = [
+        float(v)
+        for v in values
+        if v is not None
+    ]
 
-        if response.status_code != 200:
-            return {
-                "ok": False,
-                "symbol": symbol,
-                "status": response.status_code
-            }
+    if not values:
+        return 0.0
 
-        rows = response.json().get(
-            "results",
-            []
+    return mean(values)
+
+
+def format_time(minutes):
+    minutes = int(minutes)
+
+    hour = minutes // 60
+    minute = minutes % 60
+
+    return f"{hour:02d}:{minute:02d} ET"
+
+
+# ==========================================
+# BUILD DAILY DATA FROM MINUTE DATA
+# ==========================================
+
+def build_daily_sessions(rows):
+    by_day = defaultdict(list)
+
+    for row in rows:
+        minute = row.get("minute")
+
+        if minute is None:
+            continue
+
+        # מסחר רגיל בארה"ב
+        if 570 <= minute <= 960:
+            by_day[row["day"]].append(row)
+
+    sessions = []
+
+    for day, day_rows in by_day.items():
+
+        if len(day_rows) < 100:
+            continue
+
+        day_rows.sort(
+            key=lambda x: x["ts"]
         )
-
-        if not rows:
-            return {
-                "ok": False,
-                "symbol": symbol,
-                "message": "אין נתונים"
-            }
-
-        row = rows[0]
 
         open_price = float(
-            row.get("o") or 0
-        )
-
-        high_price = float(
-            row.get("h") or 0
-        )
-
-        low_price = float(
-            row.get("l") or 0
+            day_rows[0]["open"]
         )
 
         close_price = float(
-            row.get("c") or 0
+            day_rows[-1]["close"]
         )
 
-        volume = float(
-            row.get("v") or 0
+        high_row = max(
+            day_rows,
+            key=lambda x: float(x["high"])
         )
 
-        change_percent = 0.0
-        range_percent = 0.0
-
-        if open_price > 0:
-
-            change_percent = (
-                (close_price / open_price) - 1
-            ) * 100
-
-            range_percent = (
-                (high_price - low_price)
-                / open_price
-            ) * 100
-
-        # ציון סינון ראשוני בלבד
-        score = (
-            abs(change_percent) * 0.60
-            + range_percent * 0.40
+        low_row = min(
+            day_rows,
+            key=lambda x: float(x["low"])
         )
 
-        scan_cache[symbol] = {
-            "symbol": symbol,
-            "name": get_asset_name(symbol),
-            "category": "מניה",
-            "price": round(
-                close_price,
-                3
-            ),
-            "change_percent": round(
-                change_percent,
-                2
-            ),
-            "range_percent": round(
-                range_percent,
-                2
-            ),
-            "volume": volume,
-            "score": round(
-                score,
-                2
-            )
-        }
-
-        last_scan_time = (
-            datetime.now(timezone.utc)
-            .isoformat()
+        high_price = float(
+            high_row["high"]
         )
 
+        low_price = float(
+            low_row["low"]
+        )
+
+        if open_price <= 0:
+            continue
+
+        change_percent = (
+            (close_price / open_price) - 1
+        ) * 100
+
+        range_percent = (
+            (high_price - low_price)
+            / open_price
+        ) * 100
+
+        sessions.append({
+            "day": day,
+            "open": open_price,
+            "high": high_price,
+            "low": low_price,
+            "close": close_price,
+            "change_percent": change_percent,
+            "range_percent": range_percent,
+            "high_time": high_row["minute"],
+            "low_time": low_row["minute"],
+        })
+
+    sessions.sort(
+        key=lambda x: x["day"]
+    )
+
+    return sessions
+
+
+# ==========================================
+# MARKET STATE
+# ==========================================
+
+def detect_market_state(sessions):
+
+    if len(sessions) < 5:
         return {
-            "ok": True,
-            "symbol": symbol
+            "trend": "לא ידוע",
+            "status": "אין מספיק נתונים",
+            "strength": 0.0
         }
 
-    except Exception as e:
+    recent = sessions[-5:]
 
-        return {
-            "ok": False,
-            "symbol": symbol,
-            "error": str(e)
-        }
+    closes = [
+        x["close"]
+        for x in recent
+    ]
 
+    ranges = [
+        x["range_percent"]
+        for x in recent
+    ]
 
-# =========================
-# AUTOMATIC LOOP
-# =========================
+    last = recent[-1]
 
-async def automatic_scanner():
-    global scan_running
+    avg_range = safe_mean(ranges[:-1])
 
-    scan_running = True
+    if avg_range <= 0:
+        avg_range = last["range_percent"]
 
-    while True:
+    first_close = closes[0]
+    last_close = closes[-1]
 
-        await scan_one_stock()
+    trend_change = (
+        (last_close / first_close) - 1
+    ) * 100
 
-        # קריאה אחת כל 15 שניות
-        await asyncio.sleep(15)
-
-
-# =========================
-# APP STARTUP
-# =========================
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-
-    scanner_task = asyncio.create_task(
-        automatic_scanner()
+    # התכווצות / דשדוש
+    compression = (
+        last["range_percent"]
+        < avg_range * 0.70
     )
 
-    yield
-
-    scanner_task.cancel()
-
-    try:
-        await scanner_task
-    except asyncio.CancelledError:
-        pass
-
-
-app = FastAPI(
-    title="Trading Forecast",
-    version="9.0",
-    lifespan=lifespan
-)
-
-
-app.mount(
-    "/static",
-    StaticFiles(
-        directory="app/static"
-    ),
-    name="static"
-)
-
-
-# =========================
-# HOME
-# =========================
-
-@app.get("/")
-async def home():
-    return FileResponse(
-        "app/static/index.html"
+    # יום חריג ביחס לטווח האחרון
+    expansion = (
+        last["range_percent"]
+        > avg_range * 1.40
     )
 
+    if compression:
 
-@app.head("/")
-async def home_head():
-    return {}
+        status = "דשדוש / התכווצות"
 
+    elif expansion and last["change_percent"] > 0:
 
-@app.get("/sw.js")
-async def service_worker():
-    return FileResponse(
-        "app/static/sw.js",
-        media_type="application/javascript"
-    )
+        status = "תנועה חזקה מעלה"
 
+    elif expansion and last["change_percent"] < 0:
 
-# =========================
-# HEALTH
-# =========================
+        status = "תנועה חזקה מטה"
 
-@app.get("/health")
-async def health():
+    elif abs(last["change_percent"]) < 0.30:
 
-    return {
-        "ok": True,
-        "version": "9.0",
-        "universe": len(TICKERS),
-        "stocks_connected": len(
-            MASSIVE_STOCK_TICKERS
-        ),
-        "scanner_running": scan_running,
-        "scanned_so_far": len(
-            scan_cache
-        ),
-        "last_scan_time": last_scan_time
-    }
+        status = "דשדוש"
 
+    elif trend_change > 1:
 
-# =========================
-# MANUAL SCAN
-# =========================
+        status = "מגמה עולה"
 
-@app.get("/api/scan")
-async def manual_scan():
+    elif trend_change < -1:
 
-    result = await scan_one_stock()
+        status = "מגמה יורדת"
 
-    return {
-        "ok": True,
-        "result": result,
-        "scanned_so_far": len(
-            scan_cache
-        )
-    }
+    else:
 
+        status = "מצב מעורב"
 
-# =========================
-# LEADER
-# =========================
+    if trend_change > 0.50:
 
-@app.get("/api/leader")
-async def current_leader():
+        trend = "עולה"
 
-    if not scan_cache:
+    elif trend_change < -0.50:
 
-        return {
-            "ok": True,
-            "leader": None,
-            "scanned_so_far": 0,
-            "stocks_connected": len(
-                MASSIVE_STOCK_TICKERS
-            )
-        }
+        trend = "יורדת"
 
-    ranking = sorted(
-        scan_cache.values(),
-        key=lambda item: item["score"],
-        reverse=True
-    )
+    else:
 
-    return {
-        "ok": True,
-        "leader": ranking[0],
-        "scanned_so_far": len(
-            scan_cache
-        ),
-        "stocks_connected": len(
-            MASSIVE_STOCK_TICKERS
-        ),
-        "last_scan_time": last_scan_time
-    }
+        trend = "ניטרלית"
 
-
-# =========================
-# FULL RANKING
-# =========================
-
-@app.get("/api/ranking")
-async def current_ranking():
-
-    ranking = sorted(
-        scan_cache.values(),
-        key=lambda item: item["score"],
-        reverse=True
-    )
-
-    return {
-        "ok": True,
-        "count": len(ranking),
-        "ranking": ranking
-    }
+    strength = min(
+        abs(trend_change),
+        10.
