@@ -1,6 +1,10 @@
 from collections import defaultdict
-from statistics import median
+from statistics import mean, median
 
+
+# ==========================================
+# BASIC HELPERS
+# ==========================================
 
 def percentile(values, p):
     if not values:
@@ -23,6 +27,19 @@ def percentile(values, p):
     )
 
 
+def safe_mean(values):
+    values = [
+        float(v)
+        for v in values
+        if v is not None
+    ]
+
+    if not values:
+        return 0.0
+
+    return mean(values)
+
+
 def format_time(minutes):
     minutes = int(minutes)
 
@@ -32,11 +49,11 @@ def format_time(minutes):
     return f"{hour:02d}:{minute:02d} ET"
 
 
-def forecast(ticker, rows):
-    if not rows:
-        raise ValueError("אין נתונים")
+# ==========================================
+# BUILD DAILY DATA FROM MINUTE DATA
+# ==========================================
 
-    # חלוקה לימי מסחר
+def build_daily_sessions(rows):
     by_day = defaultdict(list)
 
     for row in rows:
@@ -45,23 +62,28 @@ def forecast(ticker, rows):
         if minute is None:
             continue
 
-        # שעות המסחר הרגילות בארה"ב:
-        # 09:30–16:00 ET
+        # מסחר רגיל בארה"ב
         if 570 <= minute <= 960:
             by_day[row["day"]].append(row)
 
-    daily = []
+    sessions = []
 
-    for day_rows in by_day.values():
+    for day, day_rows in by_day.items():
+
         if len(day_rows) < 100:
             continue
 
-        day_rows.sort(key=lambda x: x["ts"])
+        day_rows.sort(
+            key=lambda x: x["ts"]
+        )
 
-        opening = float(day_rows[0]["open"])
+        open_price = float(
+            day_rows[0]["open"]
+        )
 
-        if opening <= 0:
-            continue
+        close_price = float(
+            day_rows[-1]["close"]
+        )
 
         high_row = max(
             day_rows,
@@ -73,69 +95,136 @@ def forecast(ticker, rows):
             key=lambda x: float(x["low"])
         )
 
-        high = float(high_row["high"])
-        low = float(low_row["low"])
+        high_price = float(
+            high_row["high"]
+        )
 
-        daily.append({
-            "up": (high / opening - 1) * 100,
-            "down": (low / opening - 1) * 100,
+        low_price = float(
+            low_row["low"]
+        )
+
+        if open_price <= 0:
+            continue
+
+        change_percent = (
+            (close_price / open_price) - 1
+        ) * 100
+
+        range_percent = (
+            (high_price - low_price)
+            / open_price
+        ) * 100
+
+        sessions.append({
+            "day": day,
+            "open": open_price,
+            "high": high_price,
+            "low": low_price,
+            "close": close_price,
+            "change_percent": change_percent,
+            "range_percent": range_percent,
             "high_time": high_row["minute"],
-            "low_time": low_row["minute"]
+            "low_time": low_row["minute"],
         })
 
-    if len(daily) < 2:
-        raise ValueError("אין מספיק היסטוריית דקות")
-
-    # משתמשים בעד 20 ימי המסחר האחרונים
-    recent = daily[-20:]
-
-    up_moves = [d["up"] for d in recent]
-    down_moves = [d["down"] for d in recent]
-
-    high_times = [d["high_time"] for d in recent]
-    low_times = [d["low_time"] for d in recent]
-
-    last = rows[-1]
-
-    reference = float(last["close"])
-    last_open = float(last["open"])
-
-    buy = reference >= last_open
-
-    predicted_high = reference * (
-        1 + percentile(up_moves, 0.70) / 100
+    sessions.sort(
+        key=lambda x: x["day"]
     )
 
-    predicted_low = reference * (
-        1 + percentile(down_moves, 0.30) / 100
+    return sessions
+
+
+# ==========================================
+# MARKET STATE
+# ==========================================
+
+def detect_market_state(sessions):
+
+    if len(sessions) < 5:
+        return {
+            "trend": "לא ידוע",
+            "status": "אין מספיק נתונים",
+            "strength": 0.0
+        }
+
+    recent = sessions[-5:]
+
+    closes = [
+        x["close"]
+        for x in recent
+    ]
+
+    ranges = [
+        x["range_percent"]
+        for x in recent
+    ]
+
+    last = recent[-1]
+
+    avg_range = safe_mean(ranges[:-1])
+
+    if avg_range <= 0:
+        avg_range = last["range_percent"]
+
+    first_close = closes[0]
+    last_close = closes[-1]
+
+    trend_change = (
+        (last_close / first_close) - 1
+    ) * 100
+
+    # התכווצות / דשדוש
+    compression = (
+        last["range_percent"]
+        < avg_range * 0.70
     )
 
-    median_high_time = median(high_times)
-    median_low_time = median(low_times)
+    # יום חריג ביחס לטווח האחרון
+    expansion = (
+        last["range_percent"]
+        > avg_range * 1.40
+    )
 
-    if buy:
-        exit_price = predicted_high * 0.997
-        entry_time = median_low_time
-        exit_time = median_high_time
-        potential = abs(
-            predicted_high / reference - 1
-        ) * 100
+    if compression:
+
+        status = "דשדוש / התכווצות"
+
+    elif expansion and last["change_percent"] > 0:
+
+        status = "תנועה חזקה מעלה"
+
+    elif expansion and last["change_percent"] < 0:
+
+        status = "תנועה חזקה מטה"
+
+    elif abs(last["change_percent"]) < 0.30:
+
+        status = "דשדוש"
+
+    elif trend_change > 1:
+
+        status = "מגמה עולה"
+
+    elif trend_change < -1:
+
+        status = "מגמה יורדת"
+
     else:
-        exit_price = predicted_low * 1.003
-        entry_time = median_high_time
-        exit_time = median_low_time
-        potential = abs(
-            predicted_low / reference - 1
-        ) * 100
 
-    return {
-        "ticker": ticker,
-        "action": "קנייה" if buy else "מכירה",
-        "entry_price": round(reference, 3),
-        "exit_price": round(exit_price, 3),
-        "entry_time": format_time(entry_time),
-        "exit_time": format_time(exit_time),
-        "predicted_high": round(predicted_high, 3),
-        "predicted_low": round(predicted_low, 3),
-        "potential": round(potential, 2)
-    }
+        status = "מצב מעורב"
+
+    if trend_change > 0.50:
+
+        trend = "עולה"
+
+    elif trend_change < -0.50:
+
+        trend = "יורדת"
+
+    else:
+
+        trend = "ניטרלית"
+
+    strength = min(
+        abs(trend_change),
+        10.
