@@ -177,7 +177,6 @@ async def daily_history(
         high_price = float(
             row.get("h") or 0
         )
-
             low_price = float(
         row.get("l") or 0
     )
