@@ -43,7 +43,7 @@ async def health():
         "ok": True,
         "assets": len(TICKERS)
     }
-@app.get("/api/scan")
+
 async def scan_all_assets():
     """
     סורק מאוחד:
