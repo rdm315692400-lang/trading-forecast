@@ -1,4 +1,8 @@
+import asyncio
 import httpx
+
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
 from fastapi import FastAPI
 from fastapi.responses import FileResponse
@@ -13,77 +17,28 @@ from .config import (
 )
 
 
-app = FastAPI(
-    title="Trading Forecast",
-    version="8.0"
-)
-
-app.mount(
-    "/static",
-    StaticFiles(directory="app/static"),
-    name="static"
-)
-
-
 # =========================
-# CACHE
+# SCAN STORAGE
 # =========================
 
 scan_cache = {}
 scan_position = 0
+scan_running = False
+last_scan_time = None
 
 
 # =========================
-# HOME
+# SCAN ONE STOCK
 # =========================
 
-@app.get("/")
-async def home():
-    return FileResponse("app/static/index.html")
-
-
-@app.head("/")
-async def home_head():
-    return {}
-
-
-@app.get("/sw.js")
-async def service_worker():
-    return FileResponse(
-        "app/static/sw.js",
-        media_type="application/javascript"
-    )
-
-
-# =========================
-# HEALTH
-# =========================
-
-@app.get("/health")
-async def health():
-    return {
-        "ok": True,
-        "version": "8.0",
-        "assets": len(TICKERS),
-        "stocks_connected": len(MASSIVE_STOCK_TICKERS)
-    }
-
-
-# =========================
-# SCAN ONE ASSET
-# =========================
-
-@app.get("/api/scan")
-async def scan_next_asset():
+async def scan_one_stock():
     global scan_position
+    global last_scan_time
 
     symbols = MASSIVE_STOCK_TICKERS
 
     if not symbols:
-        return {
-            "ok": False,
-            "message": "אין נכסים מחוברים לסריקה"
-        }
+        return None
 
     symbol = symbols[
         scan_position % len(symbols)
@@ -113,14 +68,10 @@ async def scan_next_asset():
             return {
                 "ok": False,
                 "symbol": symbol,
-                "name": get_asset_name(symbol),
-                "status": response.status_code,
-                "scanned_so_far": len(scan_cache)
+                "status": response.status_code
             }
 
-        data = response.json()
-
-        rows = data.get(
+        rows = response.json().get(
             "results",
             []
         )
@@ -129,7 +80,6 @@ async def scan_next_asset():
             return {
                 "ok": False,
                 "symbol": symbol,
-                "name": get_asset_name(symbol),
                 "message": "אין נתונים"
             }
 
@@ -161,8 +111,7 @@ async def scan_next_asset():
         if open_price > 0:
 
             change_percent = (
-                (close_price / open_price)
-                - 1
+                (close_price / open_price) - 1
             ) * 100
 
             range_percent = (
@@ -170,14 +119,11 @@ async def scan_next_asset():
                 / open_price
             ) * 100
 
-
-        # ציון ראשוני בלבד לסינון.
-        # בהמשך נחבר את מנוע התחזית המלא.
+        # ציון סינון ראשוני בלבד
         score = (
             abs(change_percent) * 0.60
             + range_percent * 0.40
         )
-
 
         scan_cache[symbol] = {
             "symbol": symbol,
@@ -202,55 +148,195 @@ async def scan_next_asset():
             )
         }
 
-
-        ranking = sorted(
-            scan_cache.values(),
-            key=lambda item: item["score"],
-            reverse=True
+        last_scan_time = (
+            datetime.now(timezone.utc)
+            .isoformat()
         )
-
-
-        leader = (
-            ranking[0]
-            if ranking
-            else None
-        )
-
 
         return {
             "ok": True,
-
-            # היקום המלא שהגדרנו
-            "universe": len(TICKERS),
-
-            # כרגע מקור הנתונים הפעיל
-            # מחובר ל-45 המניות
-            "connected_now": len(
-                MASSIVE_STOCK_TICKERS
-            ),
-
-            "scanned_so_far": len(
-                scan_cache
-            ),
-
-            "just_scanned": {
-                "symbol": symbol,
-                "name": get_asset_name(symbol)
-            },
-
-            "leader": leader
+            "symbol": symbol
         }
-
 
     except Exception as e:
 
         return {
             "ok": False,
             "symbol": symbol,
-            "name": get_asset_name(symbol),
             "error": str(e)
         }
 
 
 # =========================
-# CURRENT
+# AUTOMATIC LOOP
+# =========================
+
+async def automatic_scanner():
+    global scan_running
+
+    scan_running = True
+
+    while True:
+
+        await scan_one_stock()
+
+        # קריאה אחת כל 15 שניות
+        await asyncio.sleep(15)
+
+
+# =========================
+# APP STARTUP
+# =========================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+
+    scanner_task = asyncio.create_task(
+        automatic_scanner()
+    )
+
+    yield
+
+    scanner_task.cancel()
+
+    try:
+        await scanner_task
+    except asyncio.CancelledError:
+        pass
+
+
+app = FastAPI(
+    title="Trading Forecast",
+    version="9.0",
+    lifespan=lifespan
+)
+
+
+app.mount(
+    "/static",
+    StaticFiles(
+        directory="app/static"
+    ),
+    name="static"
+)
+
+
+# =========================
+# HOME
+# =========================
+
+@app.get("/")
+async def home():
+    return FileResponse(
+        "app/static/index.html"
+    )
+
+
+@app.head("/")
+async def home_head():
+    return {}
+
+
+@app.get("/sw.js")
+async def service_worker():
+    return FileResponse(
+        "app/static/sw.js",
+        media_type="application/javascript"
+    )
+
+
+# =========================
+# HEALTH
+# =========================
+
+@app.get("/health")
+async def health():
+
+    return {
+        "ok": True,
+        "version": "9.0",
+        "universe": len(TICKERS),
+        "stocks_connected": len(
+            MASSIVE_STOCK_TICKERS
+        ),
+        "scanner_running": scan_running,
+        "scanned_so_far": len(
+            scan_cache
+        ),
+        "last_scan_time": last_scan_time
+    }
+
+
+# =========================
+# MANUAL SCAN
+# =========================
+
+@app.get("/api/scan")
+async def manual_scan():
+
+    result = await scan_one_stock()
+
+    return {
+        "ok": True,
+        "result": result,
+        "scanned_so_far": len(
+            scan_cache
+        )
+    }
+
+
+# =========================
+# LEADER
+# =========================
+
+@app.get("/api/leader")
+async def current_leader():
+
+    if not scan_cache:
+
+        return {
+            "ok": True,
+            "leader": None,
+            "scanned_so_far": 0,
+            "stocks_connected": len(
+                MASSIVE_STOCK_TICKERS
+            )
+        }
+
+    ranking = sorted(
+        scan_cache.values(),
+        key=lambda item: item["score"],
+        reverse=True
+    )
+
+    return {
+        "ok": True,
+        "leader": ranking[0],
+        "scanned_so_far": len(
+            scan_cache
+        ),
+        "stocks_connected": len(
+            MASSIVE_STOCK_TICKERS
+        ),
+        "last_scan_time": last_scan_time
+    }
+
+
+# =========================
+# FULL RANKING
+# =========================
+
+@app.get("/api/ranking")
+async def current_ranking():
+
+    ranking = sorted(
+        scan_cache.values(),
+        key=lambda item: item["score"],
+        reverse=True
+    )
+
+    return {
+        "ok": True,
+        "count": len(ranking),
+        "ranking": ranking
+    }
