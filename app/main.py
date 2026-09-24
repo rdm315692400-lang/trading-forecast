@@ -1,123 +1,111 @@
+import asyncio
 from fastapi import FastAPI
+from fastapi.responses import FileResponse
 
 from .config import TICKERS, MASSIVE_STOCK_TICKERS, get_asset_name
-from .data import minute_history, daily_history
-from .engine import forecast, opening_forecast
-from .trade_forecast import next_day_trade_forecast
+from .data import daily_history, minute_history
+from .model_v12 import forecast_daily
+from .timing_v12 import learn_timing
+from .cache_scanner import refresh_cycle, restore_cache, summaries, leader, status
 
-app = FastAPI(title="Trading Forecast", version="11.1")
+app = FastAPI(title="Trading Forecast", version="12.2")
+
+
+@app.on_event("startup")
+async def startup():
+    # משחזר זיכרון קבוע לפני שמתחיל רענון הדרגתי.
+    await restore_cache()
+    asyncio.create_task(refresh_cycle())
 
 
 @app.get("/")
 async def root():
-    return {
-        "ok": True,
-        "name": "Trading Forecast",
-        "version": "11.1",
-    }
+    return FileResponse("app/static/index.html")
 
 
 @app.get("/health")
 async def health():
     return {
         "ok": True,
-        "version": "11.1",
-        "universe": len(TICKERS),
-        "stocks_connected": len(MASSIVE_STOCK_TICKERS),
-        "background_scanner": False,
-        "trade_forecast_engine": True,
+        "version": "12.2",
+        "נכסים_ביקום": len(TICKERS),
+        "מניות_מחוברות": len(MASSIVE_STOCK_TICKERS),
+        "מדדים_וסחורות_ממתינים_לחיבור": 20,
+        "שפה": "עברית",
+        "סריקה": status(),
     }
 
 
-@app.get("/api/forecast/{symbol}")
-async def forecast_symbol(symbol: str):
+@app.get("/api/v12/{symbol}")
+async def asset_forecast(symbol: str):
     symbol = symbol.upper().strip()
-
     if symbol not in MASSIVE_STOCK_TICKERS:
         return {
             "ok": False,
-            "symbol": symbol,
-            "message": "המניה אינה מחוברת כרגע",
+            "סמל": symbol,
+            "הודעה": "הנכס עדיין אינו מחובר למקור נתונים מאומת",
         }
-
     try:
-        rows = await minute_history(symbol, 10)
+        daily = await daily_history(symbol)
+        minute = await minute_history(symbol, 10)
+        f = forecast_daily(daily)
+        timing = learn_timing(minute, f.get("כיוון"))
         return {
             "ok": True,
-            "symbol": symbol,
-            "name": get_asset_name(symbol),
-            "data_rows": len(rows),
-            "forecast": forecast(symbol, rows),
+            "שם": get_asset_name(symbol),
+            "סמל": symbol,
+            "ימי_היסטוריה": len(daily),
+            "תחזית": f,
+            "זמנים": timing,
         }
     except Exception as error:
-        return {
-            "ok": False,
-            "symbol": symbol,
-            "error": str(error),
-        }
+        return {"ok": False, "סמל": symbol, "שגיאה": str(error)}
 
 
-@app.get("/api/opening/{symbol}")
-async def opening(symbol: str):
-    symbol = symbol.upper().strip()
-
-    if symbol not in MASSIVE_STOCK_TICKERS:
-        return {
-            "ok": False,
-            "symbol": symbol,
-            "message": "המניה אינה מחוברת כרגע",
-        }
-
-    try:
-        rows = await daily_history(symbol)
-        return {
-            "ok": True,
-            "symbol": symbol,
-            "name": get_asset_name(symbol),
-            "daily_sessions": len(rows),
-            "opening_model": opening_forecast(rows),
-        }
-    except Exception as error:
-        return {
-            "ok": False,
-            "symbol": symbol,
-            "error": str(error),
-        }
+@app.get("/api/scan/status")
+async def scan_status():
+    return {"ok": True, "סריקה": status()}
 
 
-@app.get("/api/trade-forecast/{symbol}")
-async def trade_forecast_symbol(symbol: str):
-    symbol = symbol.upper().strip()
+@app.get("/api/scan/summaries")
+async def scan_summaries():
+    data = summaries()
+    return {
+        "ok": True,
+        "עודכנו": len(data),
+        "סיכומים": data,
+    }
 
-    if symbol not in MASSIVE_STOCK_TICKERS:
-        return {
-            "ok": False,
-            "symbol": symbol,
-            "message": "המניה אינה מחוברת כרגע",
-        }
 
-    try:
-        daily_rows = await daily_history(symbol)
-        minute_rows = await minute_history(symbol, 10)
+@app.get("/api/scan/leader")
+async def scan_leader():
+    best = leader()
+    return {
+        "ok": True,
+        "עודכנו": len(summaries()),
+        "מועמד_מוביל": best,
+        "הודעה": None if best else "אין כרגע מועמד שעובר את תנאי הסינון",
+    }
 
-        result = next_day_trade_forecast(
-            daily_rows,
-            minute_rows,
-        )
 
-        return {
-            "ok": True,
-            "symbol": symbol,
-            "name": get_asset_name(symbol),
-            "daily_sessions": len(daily_rows),
-            "minute_rows": len(minute_rows),
-            "trade_forecast": result,
-        }
+@app.post("/api/scan/start")
+async def scan_start():
+    if not status()["רץ"]:
+        asyncio.create_task(refresh_cycle())
+    return {"ok": True, "סריקה": status()}
 
-    except Exception as error:
-        return {
-            "ok": False,
-            "symbol": symbol,
-            "name": get_asset_name(symbol),
-            "error": str(error),
-        }
+
+@app.get("/api/universe")
+async def universe():
+    return {
+        "סהכ": len(TICKERS),
+        "מחוברים": len(MASSIVE_STOCK_TICKERS),
+        "נכסים": [
+            {
+                "סמל": s,
+                "שם": get_asset_name(s),
+                "מחובר": s in MASSIVE_STOCK_TICKERS,
+            }
+            for s in TICKERS
+        ],
+    }
