@@ -156,12 +156,12 @@ async def v13_cache_refresh(asset_id: str, calendar_days: int = 14):
     if not bars:
         raise HTTPException(status_code=404, detail="No minute bars returned")
 
-    written = save_bars(bars)
+    written = save_bars(bars, market_timezone=asset.market_timezone)
     return {
         "ok": True,
         "asset": asset_id,
         "downloaded_bars": len(bars),
-        "cached_writes": written,
+        "daily_documents_written": written,
         "cache": cache_status(asset_id),
         "note": "Massive was called only by this explicit refresh endpoint.",
     }
@@ -181,26 +181,27 @@ async def v13_forecast_from_cache(asset_id: str):
             detail=f"{asset_id} is not verified in the V13 asset registry",
         )
 
-    bars = load_bars(asset_id)
-    if not bars:
+    # Read one explicit daily document only.
+    # No broad Firestore scan is performed.
+    market_tz = __import__("zoneinfo").ZoneInfo(asset.market_timezone)
+
+    latest_market_day = date.today() - timedelta(days=1)
+    while latest_market_day.weekday() >= 5:
+        latest_market_day -= timedelta(days=1)
+
+    day_bars = load_bars(
+        asset_id,
+        market_days=[latest_market_day.isoformat()],
+    )
+    if not day_bars:
         raise HTTPException(
             status_code=404,
             detail=(
-                f"No V13 cached minute bars for {asset_id}. "
-                "Run cache-refresh once when the provider rate limit permits."
+                f"No V13 daily cache document for {asset_id} on "
+                f"{latest_market_day.isoformat()}. "
+                "Run cache-refresh once when Firestore quota permits."
             ),
         )
-
-    # Use the latest completed cached market day.
-    market_tz = __import__("zoneinfo").ZoneInfo(asset.market_timezone)
-    latest_market_day = max(
-        b.timestamp_utc.astimezone(market_tz).date() for b in bars
-    )
-
-    day_bars = [
-        b for b in bars
-        if b.timestamp_utc.astimezone(market_tz).date() == latest_market_day
-    ]
 
     store = HistoricalStore()
     store.extend(day_bars)
