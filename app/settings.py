@@ -1,0 +1,10 @@
+import os
+
+APP_VERSION = "14.0-stage3-final-candidate"
+HORIZONS_MINUTES = (15, 30, 60, 90, 120, 180)
+DEFAULT_PROVIDER_LAG_DAYS = int(os.getenv("DEFAULT_PROVIDER_LAG_DAYS", "3"))
+MAX_REFRESH_DAYS = 14
+MIN_VISIBLE_BARS = 61
+CACHE_COLLECTION = "v14_daily_bar_cache"
+FORECAST_COLLECTION = "v14_frozen_forecasts"
+OUTCOME_COLLECTION = "v14_forecast_outcomes"
